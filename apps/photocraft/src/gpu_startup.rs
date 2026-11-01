@@ -14,8 +14,9 @@
 //! The choice that worked is remembered in `performance.gpuBackend` (Preferences › Performance,
 //! where it can be reset). With `auto`, Intel and Qualcomm (Windows on ARM) adapters on Windows
 //! use DX12, and when DXGI lists an Intel adapter the instance leaves Vulkan out, so the first
-//! start doesn't load the Intel Vulkan driver either. `WGPU_BACKEND` still overrides everything,
-//! and `--safe-gpu` forces the CPU path for one launch.
+//! start doesn't load the Intel Vulkan driver either. Between GPUs of the same type, `auto` on
+//! Windows draws on the one that drives the primary display (#7830). `WGPU_BACKEND` still
+//! overrides everything, and `--safe-gpu` forces the CPU path for one launch.
 //!
 //! "CPU" composites on the CPU and draws the window with a software adapter where the platform
 //! has one (WARP on Windows, llvmpipe over GL elsewhere). On Linux a GL adapter that can't present
@@ -270,15 +271,125 @@ pub struct Candidate {
     pub surface_ok: bool,
     /// Its name matches the adapter the user asked for ([`adapter_matches`]).
     pub wanted: bool,
+    /// Which display its GPU drives ([`display_gpus`]).
+    pub shows: Shows,
+}
+
+/// Which display an adapter's GPU drives, best first. `Nothing` also stands for "the system didn't
+/// say" (off Windows, Remote Desktop, a GPU without PCI ids), so then every adapter ranks alike.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Shows {
+    /// The primary display.
+    Primary,
+    /// Another display attached to the desktop.
+    Display,
+    #[default]
+    Nothing,
+}
+
+/// A GPU that drives a display attached to the desktop ([`display_gpus`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayGpu {
+    /// PCI `(vendor, device)` ids, as wgpu's `AdapterInfo` reports them.
+    pub pci: (u32, u32),
+    /// Drives the primary display.
+    pub primary: bool,
+}
+
+impl std::fmt::Display for DisplayGpu {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:04x}:{:04x}{}", self.pci.0, self.pci.1, if self.primary { " (primary)" } else { "" })
+    }
+}
+
+/// What `displays` say about the GPU with PCI ids `pci`.
+pub fn shows(displays: &[DisplayGpu], pci: (u32, u32)) -> Shows {
+    match displays.iter().find(|d| d.pci == pci) {
+        Some(d) if d.primary => Shows::Primary,
+        Some(_) => Shows::Display,
+        None => Shows::Nothing,
+    }
+}
+
+/// The GPUs that drive a display, each once (#7830).
+///
+/// Why: on a Windows desktop with two discrete GPUs, nothing else separated them, and DX12's lead
+/// for Intel picked an Arc without a monitor over the Radeon driving it; every frame then crossed
+/// adapters, and the compositor's first build took ~4 s on every launch against ~0.13 s on the
+/// Radeon. VectorCraft (vectorcraft#851) and PdfCraft (pdfcraft#378) ask the same question.
+/// Out: Windows' display devices (`EnumDisplayDevices`, those attached to the desktop); empty
+///      elsewhere, and where Windows lists none with PCI ids. Empty changes no ranking.
+pub fn display_gpus() -> Vec<DisplayGpu> {
+    #[cfg(windows)]
+    {
+        windows_display_gpus()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+/// Record that the GPU `pci` drives a display, merging it with its other displays.
+fn add_display_gpu(gpus: &mut Vec<DisplayGpu>, pci: (u32, u32), primary: bool) {
+    match gpus.iter_mut().find(|g| g.pci == pci) {
+        Some(gpu) => gpu.primary |= primary,
+        None => gpus.push(DisplayGpu { pci, primary }),
+    }
+}
+
+/// Windows' display devices: one per GPU output; those `ATTACHED_TO_DESKTOP` show a monitor, one
+/// of them the `PRIMARY_DEVICE`. Same approach as vectorcraft#851: the registry doesn't say which
+/// adapter drives a display, and WMI reports a resolution for a GPU without a monitor.
+/// Out: each GPU once; Remote Desktop and other non-PCI devices are left out.
+#[cfg(windows)]
+fn windows_display_gpus() -> Vec<DisplayGpu> {
+    use winsafe::co::DISPLAY_DEVICE as Flags;
+    let mut gpus = Vec::new();
+    // A machine has a handful of display devices; the cap only bounds a runaway enumeration.
+    for device in winsafe::EnumDisplayDevices(None, None).take(256) {
+        let device = match device {
+            Ok(d) => d,
+            // The enumeration ends with "no more items" or, from a driver, with any other error.
+            Err(e) => {
+                log::debug!("display devices: {e}");
+                break;
+            }
+        };
+        if !device.StateFlags.has(Flags::ATTACHED_TO_DESKTOP) {
+            continue;
+        }
+        let Some(pci) = pci_ids(&device.DeviceID()) else { continue };
+        add_display_gpu(&mut gpus, pci, device.StateFlags.has(Flags::PRIMARY_DEVICE));
+    }
+    gpus
+}
+
+/// The PCI `(vendor, device)` of a Windows device id such as
+/// `PCI\VEN_1002&DEV_67DF&SUBSYS_E3531DA2&REV_E7`, any case.
+/// Out: `None` for anything else (`ROOT\BasicDisplay\0000`, a missing or non-hex field).
+fn pci_ids(device_id: &str) -> Option<(u32, u32)> {
+    let field = |key: &str| {
+        device_id.split(['\\', '&']).find_map(|part| {
+            let (name, hex) = part.split_at_checked(key.len())?;
+            if name.eq_ignore_ascii_case(key) { u32::from_str_radix(hex, 16).ok() } else { None }
+        })
+    };
+    Some((field("VEN_")?, field("DEV_")?))
 }
 
 /// Rank of an adapter (lower is better): high-performance device types first (egui's power
-/// preference) or software adapters first for `cpu`; then backends, with DX12 before Vulkan for
-/// Intel and Qualcomm on Windows ([`dx12_first_on_windows`]). For `cpu`, any GL adapter comes
-/// before Vulkan, which is only the fallback for presenting the window (see [`backends`]). On
-/// Windows GL comes after every other adapter, WARP included: GL there (VMware's SVGA3D, GL-only
-/// old GPUs) drew a black window (#5191, #1788).
-fn rank(a: &Candidate, backend: GpuBackend, os: Os) -> (u8, u8, u8) {
+/// preference) or software adapters first for `cpu`; then, among adapters of the same type, the
+/// GPU that drives the primary display, then one that drives another display ([`Shows`], #7830);
+/// then backends, with DX12 before Vulkan for Intel and Qualcomm on Windows
+/// ([`dx12_first_on_windows`]). For `cpu`, any GL adapter comes before Vulkan, which is only the
+/// fallback for presenting the window (see [`backends`]), and displays don't count. On Windows GL
+/// comes after every other adapter, WARP included: GL there (VMware's SVGA3D, GL-only old GPUs)
+/// drew a black window (#5191, #1788).
+///
+/// The display ranks after the device type, not before as in vectorcraft#851: a hybrid laptop's
+/// panel hangs off the integrated GPU, and moving it off the discrete one is not this fix.
+fn rank(a: &Candidate, backend: GpuBackend, os: Os) -> (u8, u8, Shows, u8) {
     let fallback = u8::from((backend == GpuBackend::Cpu && a.backend == wgpu::Backend::Vulkan) || (os == Os::Windows && a.backend == wgpu::Backend::Gl));
     let ty = match a.device_type {
         wgpu::DeviceType::DiscreteGpu => 0,
@@ -299,7 +410,8 @@ fn rank(a: &Candidate, backend: GpuBackend, os: Os) -> (u8, u8, u8) {
         wgpu::Backend::Gl => 3,
         wgpu::Backend::BrowserWebGpu | wgpu::Backend::Noop => 4,
     };
-    (fallback, ty, be)
+    let shows = if backend == GpuBackend::Cpu { Shows::Nothing } else { a.shows };
+    (fallback, ty, shows, be)
 }
 
 /// The adapter to use among `adapters` (`None` when there is none). Adapters the user asked for
@@ -391,6 +503,14 @@ pub fn configure(setup: &mut egui_wgpu::WgpuSetup, plan: &Plan, os: Os, wanted: 
         let vulkan_left_out = without_vulkan.is_some();
         let wanted = applicable_adapter(wanted, plan.backend, ADAPTER_CHOICE);
         let select = wanted.is_some() || (plan.env.is_none() && (plan.backend == GpuBackend::Cpu || (plan.backend == GpuBackend::Auto && os == Os::Windows)));
+        // Which GPU drives which display: only `auto` on Windows asks (#7830). A chosen backend,
+        // `WGPU_BACKEND` and CPU mode keep their own choice.
+        let asks_displays = plan.env.is_none() && plan.backend == GpuBackend::Auto && os == Os::Windows;
+        let displays = if asks_displays { display_gpus() } else { Vec::new() };
+        if asks_displays {
+            let listed: Vec<String> = displays.iter().map(ToString::to_string).collect();
+            log::info!("display GPUs (PCI vendor:device): {}", if listed.is_empty() { "unknown".to_string() } else { listed.join(", ") });
+        }
         if select {
             let backend = plan.backend;
             create.native_adapter_selector = Some(Arc::new(move |adapters: &[wgpu::Adapter], surface: Option<&wgpu::Surface<'_>>| {
@@ -404,6 +524,7 @@ pub fn configure(setup: &mut egui_wgpu::WgpuSetup, plan: &Plan, os: Os, wanted: 
                             backend: i.backend,
                             surface_ok: surface.is_none_or(|s| a.is_surface_supported(s)),
                             wanted: wanted.as_deref().is_some_and(|w| adapter_matches(&i.name, w)),
+                            shows: shows(&displays, (i.vendor, i.device)),
                         }
                     })
                     .collect();
