@@ -138,7 +138,102 @@ fn safe_gpu_forces_the_cpu_for_one_launch() {
 }
 
 fn cand(vendor: u32, device_type: wgpu::DeviceType, backend: wgpu::Backend) -> Candidate {
-    Candidate { vendor, device_type, backend, surface_ok: true, wanted: false }
+    Candidate { vendor, device_type, backend, surface_ok: true, wanted: false, shows: Shows::Nothing }
+}
+
+const ARC_B60: (u32, u32) = (INTEL, 0xe211);
+const RX_580: (u32, u32) = (0x1002, 0x67df);
+const RTX_4060: (u32, u32) = (0x10de, 0x28a0);
+const UHD_770: (u32, u32) = (INTEL, 0xa780);
+
+/// An adapter of the GPU `pci`, with what `displays` say about it, as `configure` builds it.
+fn on(pci: (u32, u32), device_type: wgpu::DeviceType, backend: wgpu::Backend, displays: &[DisplayGpu]) -> Candidate {
+    Candidate { shows: shows(displays, pci), ..cand(pci.0, device_type, backend) }
+}
+
+fn monitor(pci: (u32, u32)) -> DisplayGpu {
+    DisplayGpu { pci, primary: false }
+}
+
+fn primary(pci: (u32, u32)) -> DisplayGpu {
+    DisplayGpu { pci, primary: true }
+}
+
+/// #7830: a Windows desktop with an Arc Pro B60 (no monitor) and an RX 580 driving the monitor.
+/// With an Intel adapter listed, `auto` leaves Vulkan out of the instance, so both are DX12, and
+/// Intel's DX12 lead picked the Arc. The GPU that drives the primary display now comes first.
+#[test]
+fn two_discrete_gpus_on_windows_draw_on_the_one_driving_the_primary_display() {
+    use wgpu::{Backend as B, DeviceType as T};
+    let machine = |displays: &[DisplayGpu]| {
+        [on(ARC_B60, T::DiscreteGpu, B::Dx12, displays), on(RX_580, T::DiscreteGpu, B::Dx12, displays), on((0x1414, 0x008c), T::Cpu, B::Dx12, displays)]
+    };
+    assert_eq!(pick(&machine(&[]), Auto, Os::Windows), Some(0), "unknown displays: the order as before");
+    assert_eq!(pick(&machine(&[primary(RX_580)]), Auto, Os::Windows), Some(1));
+    assert_eq!(pick(&machine(&[monitor(RX_580)]), Auto, Os::Windows), Some(1));
+    assert_eq!(pick(&machine(&[primary(ARC_B60)]), Auto, Os::Windows), Some(0));
+    // A monitor on each: the primary display's GPU.
+    assert_eq!(pick(&machine(&[monitor(ARC_B60), primary(RX_580)]), Auto, Os::Windows), Some(1));
+    assert_eq!(pick(&machine(&[primary(ARC_B60), monitor(RX_580)]), Auto, Os::Windows), Some(0));
+    // The display GPU's adapter must still present.
+    let mut m = machine(&[primary(RX_580)]);
+    m[1].surface_ok = false;
+    assert_eq!(pick(&m, Auto, Os::Windows), Some(0));
+    // Among one GPU's adapters the backend order stands: Intel's DX12 before its Vulkan.
+    let d = [primary(ARC_B60)];
+    let arc = [on(ARC_B60, T::DiscreteGpu, B::Vulkan, &d), on(ARC_B60, T::DiscreteGpu, B::Dx12, &d), on(RX_580, T::DiscreteGpu, B::Vulkan, &d)];
+    assert_eq!(pick(&arc, Auto, Os::Windows), Some(1));
+}
+
+/// A hybrid laptop's panel is on the integrated GPU; the discrete one drives nothing and still
+/// draws, as before (the device type ranks first). CPU mode ignores the displays.
+#[test]
+fn the_display_only_decides_between_gpus_of_the_same_type() {
+    use wgpu::{Backend as B, DeviceType as T};
+    let d = [primary(UHD_770)];
+    let laptop = [on(UHD_770, T::IntegratedGpu, B::Dx12, &d), on(RTX_4060, T::DiscreteGpu, B::Dx12, &d), on(RTX_4060, T::DiscreteGpu, B::Vulkan, &d)];
+    assert_eq!(pick(&laptop, Auto, Os::Windows), Some(2));
+    let d = [primary(RX_580)];
+    let soft = [on(RX_580, T::DiscreteGpu, B::Dx12, &d), on((0x1414, 0x008c), T::Cpu, B::Dx12, &d)];
+    assert_eq!(pick(&soft, Cpu, Os::Windows), Some(1), "CPU mode keeps the software adapter first");
+}
+
+#[test]
+fn display_gpus_are_matched_by_pci_ids_and_merged() {
+    assert_eq!(shows(&[monitor(RX_580), primary(ARC_B60)], ARC_B60), Shows::Primary);
+    assert_eq!(shows(&[monitor(RX_580)], RX_580), Shows::Display);
+    assert_eq!(shows(&[monitor(RX_580)], (0x1002, 0x67ef)), Shows::Nothing, "same vendor, other device");
+    assert_eq!(shows(&[], RX_580), Shows::Nothing);
+    let mut gpus = vec![];
+    add_display_gpu(&mut gpus, RX_580, false);
+    add_display_gpu(&mut gpus, RX_580, true);
+    add_display_gpu(&mut gpus, ARC_B60, false);
+    assert_eq!(gpus, [primary(RX_580), monitor(ARC_B60)]);
+    assert_eq!(primary(RX_580).to_string(), "1002:67df (primary)");
+    assert_eq!(monitor(ARC_B60).to_string(), "8086:e211");
+}
+
+#[test]
+fn pci_ids_come_from_windows_device_ids() {
+    assert_eq!(pci_ids(r"PCI\VEN_1002&DEV_67DF&SUBSYS_E3531DA2&REV_E7"), Some(RX_580));
+    assert_eq!(pci_ids(r"PCI\VEN_8086&DEV_E211&SUBSYS_0300172F&REV_00\6&117A1E4E&0&00080019"), Some(ARC_B60));
+    assert_eq!(pci_ids(r"pci\ven_10de&dev_28a0"), Some(RTX_4060));
+    for id in [r"ROOT\BasicDisplay\0000", r"PCI\VEN_10DE&SUBSYS_40421458", r"PCI\VEN_10DE&DEV_ZZZZ", "VEN_&DEV_", "", "ñ\\VEN_é"] {
+        assert_eq!(pci_ids(id), None, "{id}");
+    }
+}
+
+/// Whatever this machine has: PCI devices only, at most one primary, none twice. (A headless CI
+/// runner may list none.)
+#[cfg(windows)]
+#[test]
+fn windows_lists_each_gpu_with_a_monitor_once() {
+    let gpus = windows_display_gpus();
+    assert!(gpus.iter().filter(|g| g.primary).count() <= 1, "{gpus:?}");
+    for (i, g) in gpus.iter().enumerate() {
+        assert_ne!(g.pci.0, 0, "{gpus:?}");
+        assert!(!gpus[..i].iter().any(|h| h.pci == g.pci), "{gpus:?}");
+    }
 }
 
 #[test]
