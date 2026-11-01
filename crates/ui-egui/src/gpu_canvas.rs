@@ -145,6 +145,40 @@ pub fn supports_f16_canvas(adapter: &wgpu::Adapter) -> bool {
     f.allowed_usages.contains(usages) && f.flags.contains(wgpu::TextureFormatFeatureFlags::FILTERABLE)
 }
 
+/// The thread building the wgpu compositor since start-up, and what it ends with.
+type CompositorBuild = std::thread::JoinHandle<Result<photocraft_gpu::Compositor, photocraft_gpu::Unsupported>>;
+
+/// Start building the wgpu compositor on its own thread, so that the first document of the
+/// session finds it ready instead of waiting for it.
+///
+/// Why: `Compositor::try_new_with_format` compiles every compose pipeline, one to a few seconds
+/// depending on the driver, and used to run inside the first composite on the UI thread: File ›
+/// New and the first open drew no frame until it was done (#4831). wgpu keeps error scopes per
+/// thread, so the build's own error capture sees only its errors there, and the UI thread's
+/// uncaptured errors still reach the health watch meanwhile.
+/// In: the canvas's device (cloned into the thread) and adapter (read here for the accumulation
+///     format; the thread needs no adapter).
+/// Out: the handle to join, or `None` when the OS refused a thread (logged; the first composite
+///      then builds inline, as before).
+#[cfg(not(target_arch = "wasm32"))]
+fn spawn_compositor_build(device: &wgpu::Device, adapter: &wgpu::Adapter) -> Option<CompositorBuild> {
+    let acc_format = photocraft_gpu::Compositor::preferred_acc_format(adapter);
+    let device = device.clone();
+    let spawned = std::thread::Builder::new().name("gpu-compositor".into()).spawn(move || {
+        let t0 = now_ms();
+        let built = photocraft_gpu::Compositor::try_new_with_format(&device, acc_format);
+        log::info!("gpu compositor: built on its own thread in {:.0} ms ({})", now_ms() - t0, if built.is_ok() { "ok" } else { "failed" });
+        built
+    });
+    match spawned {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            log::warn!("gpu canvas: couldn't start the compositor build thread ({e}); building on first use");
+            None
+        }
+    }
+}
+
 impl GpuCanvas {
     /// Create pipelines and register resources with the egui renderer.
     pub fn new(rs: &RenderState) -> Self {
@@ -152,6 +186,8 @@ impl GpuCanvas {
     }
 
     /// Like [`GpuCanvas::new`] with a preferred texture tile side (`PHOTOCRAFT_GPU_TILE` wins).
+    /// On native it also starts building the wgpu compositor on its own thread
+    /// ([`spawn_compositor_build`]); the first composite picks it up.
     pub fn with_tile(rs: &RenderState, tile: Option<u32>) -> Self {
         let max = rs.device.limits().max_texture_dimension_2d;
         let env_tile = std::env::var("PHOTOCRAFT_GPU_TILE").ok().and_then(|v| v.parse::<u32>().ok());
@@ -170,6 +206,10 @@ impl GpuCanvas {
         res.separate_mip_targets = separate_mip_targets(info.backend, info.vendor, std::env::var("PHOTOCRAFT_SEPARATE_MIPS").ok().as_deref());
         let vram = video_memory(&info);
         res.canvas_budget.store(canvas_budget(physical_memory(), vram), Ordering::Relaxed);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            res.compositor_build = spawn_compositor_build(&rs.device, &rs.adapter);
+        }
         let budget = res.canvas_budget.clone();
         rs.renderer.write().callback_resources.insert(res);
         log::info!(
@@ -196,6 +236,8 @@ impl GpuCanvas {
         let mut r = self.rs.renderer.write();
         if let Some(res) = r.callback_resources.get_mut::<Resources>() {
             res.compositor = None;
+            // A build still running finishes on its own and is dropped: nothing joins it now.
+            res.compositor_build = None;
             res.compositor_failed = Some(photocraft_gpu::Unsupported(self.fault().map_or_else(|| "GPU canvas released".into(), |f| f.to_string())));
             res.docs.clear();
             res.luts.clear();
@@ -449,7 +491,8 @@ impl GpuCanvas {
     /// (no CPU pixels, no upload of the composite). `encode_srgb` stores the sRGB encoding of the
     /// composite (linear documents, see `photocraft_engine::display_color`). Returns `Err` when the
     /// document uses features the GPU compositor doesn't cover yet; the caller then falls back to
-    /// the CPU compositor.
+    /// the CPU compositor. The first call takes the compositor built since start-up, joining its
+    /// thread when that is still running; later calls reuse it.
     pub fn composite(
         &self,
         doc: &photocraft_doc::Document,
@@ -475,14 +518,28 @@ impl GpuCanvas {
         }
         let mut comp = match res.compositor.take() {
             Some(c) => c,
-            None => match photocraft_gpu::Compositor::try_new_with_format(device, photocraft_gpu::Compositor::preferred_acc_format(&self.rs.adapter)) {
-                Ok(c) => c,
-                Err(e) => {
-                    log::warn!("{e}; using the CPU compositor");
-                    res.compositor_failed = Some(e.clone());
-                    return Err(e);
+            None => {
+                // Built on its own thread since start-up (native): join it rather than build a
+                // second one. The join costs what the inline build did at worst, nothing once done.
+                let built = match res.compositor_build.take() {
+                    Some(handle) => {
+                        let t0 = now_ms();
+                        let ready = handle.is_finished();
+                        let joined = handle.join().unwrap_or_else(|_| Err(photocraft_gpu::Unsupported("the compositor build thread panicked".into())));
+                        log::info!("gpu compositor: first composite {} the build ({:.0} ms)", if ready { "found" } else { "waited for" }, now_ms() - t0);
+                        joined
+                    }
+                    None => photocraft_gpu::Compositor::try_new_with_format(device, photocraft_gpu::Compositor::preferred_acc_format(&self.rs.adapter)),
+                };
+                match built {
+                    Ok(c) => c,
+                    Err(e) => {
+                        log::warn!("{e}; using the CPU compositor");
+                        res.compositor_failed = Some(e.clone());
+                        return Err(e);
+                    }
                 }
-            },
+            }
         };
         comp.set_health(self.health.clone());
         // Measured, not waited for: the timestamps come back a frame or two later.
@@ -1548,10 +1605,15 @@ struct Resources {
     /// Build each mip level in a scratch texture and copy it back instead of rendering into
     /// the level directly (see [`separate_mip_targets`]).
     separate_mip_targets: bool,
-    /// The wgpu layer compositor (created on first use).
+    /// The wgpu layer compositor, between composites (built at start-up on its own thread on
+    /// native, on first use elsewhere; see `compositor_build`).
     compositor: Option<photocraft_gpu::Compositor>,
     /// Why the wgpu compositor couldn't be created (then the CPU compositor is used).
     compositor_failed: Option<photocraft_gpu::Unsupported>,
+    /// The compositor being built on its own thread since start-up (native only), so that the
+    /// first document finds it ready; the first composite joins it. `None` on wasm, when the
+    /// thread couldn't start, and once joined.
+    compositor_build: Option<CompositorBuild>,
     /// The device's health: the paint callback issues no GPU work once it's lost.
     health: photocraft_gpu::DeviceHealth,
     /// GPU memory the compositor may hold (`None`: its default), and the document area the
@@ -1709,6 +1771,10 @@ fn pipeline(
 }
 
 impl Resources {
+    /// The paint callback's state: the canvas, mip and encode pipelines on `device` for a
+    /// `target` window format, with their `Rgba16Float` variants only when `high` (an adapter
+    /// that can't render the format gets none). Documents, views and the compositor start empty;
+    /// [`GpuCanvas::with_tile`] fills in what it knows and starts the compositor build.
     fn new(device: &wgpu::Device, queue: &wgpu::Queue, target: wgpu::TextureFormat, high: bool) -> Self {
         let module =
             device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("pc_canvas"), source: wgpu::ShaderSource::Wgsl(CANVAS_WGSL.into()) });
@@ -1825,6 +1891,7 @@ impl Resources {
             separate_mip_targets: false,
             compositor: None,
             compositor_failed: None,
+            compositor_build: None,
             health: photocraft_gpu::DeviceHealth::new(),
             compositor_budget: None,
             layer_fit: None,
