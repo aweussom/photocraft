@@ -28,6 +28,8 @@ impl PhotocraftApp {
             }
         };
         self.perf.gpu_info.canvas = "gpu".into();
+        // Ready, or nearly, by the first New or Open (#4831).
+        gpu.prebuild_compositor();
         self.window_device = Some((rs.device.clone(), gpu.health().clone()));
         self.gpu = Some(gpu);
         self.prefs_rt.gpu_style = None;

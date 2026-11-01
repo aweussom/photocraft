@@ -4,6 +4,9 @@ use super::shaders::{CANVAS_WGSL, ENCODE_WGSL, MIP_WGSL};
 use super::texels::LayerFit;
 use super::{FORMAT, FORMAT_HIGH, HashMap, NonZeroU64, TILE_UNIFORM_SIZE, VIEW_FLOATS, VIEW_UNIFORM_SIZE, wgpu};
 
+/// A thread building the wgpu compositor, and what it ends with.
+pub(super) type CompositorBuild = std::thread::JoinHandle<Result<photocraft_gpu::Compositor, photocraft_gpu::Unsupported>>;
+
 pub(super) struct Resources {
     pub(super) view_bgl: wgpu::BindGroupLayout,
     pub(super) tile_bgl: wgpu::BindGroupLayout,
@@ -24,6 +27,9 @@ pub(super) struct Resources {
     pub(super) separate_mip_targets: bool,
     /// The wgpu layer compositor (created on first use).
     pub(super) compositor: Option<photocraft_gpu::Compositor>,
+    /// The thread building it since launch (`GpuCanvas::prebuild_compositor`); the first
+    /// composite takes the result.
+    pub(super) compositor_build: Option<CompositorBuild>,
     /// Why the wgpu compositor couldn't be created (then the CPU compositor is used).
     pub(super) compositor_failed: Option<photocraft_gpu::Unsupported>,
     /// The device's health: the paint callback issues no GPU work once it's lost.
@@ -359,6 +365,7 @@ impl Resources {
             out_linear: target.is_srgb(),
             separate_mip_targets: false,
             compositor: None,
+            compositor_build: None,
             compositor_failed: None,
             health: photocraft_gpu::DeviceHealth::new(),
             compositor_budget: None,

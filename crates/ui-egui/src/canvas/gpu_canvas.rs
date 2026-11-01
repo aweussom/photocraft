@@ -226,6 +226,46 @@ impl GpuCanvas {
         Self { rs: rs.clone(), tile, high, health, vram, canvas_budget: budget, camera_raw: Default::default(), camera_raw_started: Default::default() }
     }
 
+    /// Start building the wgpu compositor on its own thread, so that the first document of the
+    /// session finds it ready instead of building it inside its first frame (#4831).
+    ///
+    /// Why: `Compositor::try_new_with_format` compiles some 30 pipelines, 2.6–3.4 s on every launch
+    /// on a Radeon RX 580 with DX12 and about 4 s on an Arc Pro B60 (release builds, #4831), and
+    /// it ran in the first composite on the UI thread: after File › New or the first open, no frame
+    /// drew until it ended. Started by the app only, so tests and benches that never composite
+    /// don't build one.
+    /// In: nothing. Does nothing on the web, under `PHOTOCRAFT_CPU_COMPOSE`, after a fault, or
+    ///     when a compositor exists, failed, or is already building.
+    /// Out: none; the first [`GpuCanvas::composite`] takes the result, waiting for the rest of the
+    ///      build if it is still running. When the OS refuses a thread, that composite builds it
+    ///      itself, as before.
+    pub fn prebuild_compositor(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if std::env::var_os("PHOTOCRAFT_CPU_COMPOSE").is_some() || self.fault().is_some() {
+                return;
+            }
+            let mut r = self.rs.renderer.write();
+            let Some(res) = r.callback_resources.get_mut::<Resources>() else { return };
+            if res.compositor.is_some() || res.compositor_failed.is_some() || res.compositor_build.is_some() {
+                return;
+            }
+            let device = self.rs.device.clone();
+            let acc_format = photocraft_gpu::Compositor::preferred_acc_format(&self.rs.adapter);
+            let spawned = std::thread::Builder::new().name("gpu-compositor".into()).spawn(move || {
+                let t0 = now_ms();
+                let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| photocraft_gpu::Compositor::try_new_with_format(&device, acc_format)))
+                    .unwrap_or_else(|_| Err(photocraft_gpu::Unsupported("building the GPU compositor panicked".into())));
+                log::info!("gpu compositor: built in the background in {:.0} ms ({})", now_ms() - t0, if built.is_ok() { "ok" } else { "failed" });
+                built
+            });
+            match spawned {
+                Ok(build) => res.compositor_build = Some(build),
+                Err(e) => log::warn!("gpu compositor: no thread to build it in the background ({e}); the first composite builds it"),
+            }
+        }
+    }
+
     /// The device's health flag (shared with the wgpu compositor and the paint callback).
     pub fn health(&self) -> &photocraft_gpu::DeviceHealth {
         &self.health
@@ -278,6 +318,8 @@ impl GpuCanvas {
         let mut r = self.rs.renderer.write();
         if let Some(res) = r.callback_resources.get_mut::<Resources>() {
             res.compositor = None;
+            // A build still running ends on its own and is dropped: nothing joins it now.
+            res.compositor_build = None;
             res.compositor_failed = Some(photocraft_gpu::Unsupported(self.fault().map_or_else(|| "GPU canvas released".into(), |f| f.to_string())));
             res.docs.clear();
             res.luts.clear();
@@ -374,8 +416,17 @@ impl GpuCanvas {
         let mut r = self.rs.renderer.write();
         if let Some(res) = r.callback_resources.get_mut::<Resources>() {
             res.compositor = None;
+            res.compositor_build = None;
             res.compositor_failed = Some(photocraft_gpu::Unsupported(msg.into()));
         }
+    }
+
+    /// Whether the compositor is building in the background ([`GpuCanvas::prebuild_compositor`]),
+    /// and whether it is built.
+    #[cfg(test)]
+    pub(crate) fn compositor_state(&self) -> (bool, bool) {
+        let r = self.rs.renderer.read();
+        r.callback_resources.get::<Resources>().map_or((false, false), |res| (res.compositor_build.is_some(), res.compositor.is_some()))
     }
 
     /// Why the compositor couldn't be built, once it couldn't (see [`GpuCanvas::composite`]).
@@ -601,14 +652,28 @@ impl GpuCanvas {
         }
         let mut comp = match res.compositor.take() {
             Some(c) => c,
-            None => match photocraft_gpu::Compositor::try_new_with_format(device, photocraft_gpu::Compositor::preferred_acc_format(&self.rs.adapter)) {
-                Ok(c) => c,
-                Err(e) => {
-                    // `render_path::note` logs it, once, as this document's reason.
-                    res.compositor_failed = Some(e.clone());
-                    return Err(e);
+            None => {
+                // Building since launch ([`GpuCanvas::prebuild_compositor`]): take it, waiting for
+                // the rest if it is still running, rather than build a second one.
+                let built = match res.compositor_build.take() {
+                    Some(build) => {
+                        let t0 = now_ms();
+                        let ready = build.is_finished();
+                        let joined = build.join().unwrap_or_else(|_| Err(photocraft_gpu::Unsupported("the GPU compositor's build thread panicked".into())));
+                        log::info!("gpu compositor: the first composite {} the background build ({:.0} ms)", if ready { "found" } else { "waited for" }, now_ms() - t0);
+                        joined
+                    }
+                    None => photocraft_gpu::Compositor::try_new_with_format(device, photocraft_gpu::Compositor::preferred_acc_format(&self.rs.adapter)),
+                };
+                match built {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // `render_path::note` logs it, once, as this document's reason.
+                        res.compositor_failed = Some(e.clone());
+                        return Err(e);
+                    }
                 }
-            },
+            }
         };
         comp.set_health(self.health.clone());
         // Measured, not waited for: the timestamps come back a frame or two later.

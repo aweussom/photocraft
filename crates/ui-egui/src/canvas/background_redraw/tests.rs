@@ -583,6 +583,22 @@ fn over_budget_fallback_shows_working_set_and_budget() {
     assert!(text.contains("of GPU memory, budget") && text.contains('M'), "{text}");
 }
 
+/// #4831: the app starts building the wgpu compositor when it creates the GPU canvas, and the
+/// first document's composite takes that build instead of building one on the UI thread.
+#[test]
+fn the_first_document_takes_the_compositor_built_at_launch() {
+    let _gpu = photocraft_testkit::gpu_lock();
+    let Some(mut g) = gpu_app() else { return };
+    assert_eq!(g.observer.compositor_state(), (true, false), "building since `set_wgpu`");
+    g.harness.state_mut().run("file.new", json!({"width": 400, "height": 300, "background": "#336699"})).expect("new");
+    g.harness.run_steps(3);
+    assert!(on_gpu_canvas(&g));
+    assert_eq!(g.observer.compositor_state(), (false, true), "taken by the first composite");
+    // Asking again changes nothing: one compositor per device.
+    g.harness.state().gpu.as_ref().expect("gpu canvas").prebuild_compositor();
+    assert_eq!(g.observer.compositor_state(), (false, true));
+}
+
 #[test]
 fn a_compositor_build_failure_shows_its_reason() {
     use egui_kittest::kittest::Queryable;
